@@ -280,6 +280,19 @@ class ExecutionStream:
         else:
             self._scoped_event_bus = None
 
+        # Execution evaluator — closes the self-improvement feedback loop.
+        # Evaluates every completed execution against goal criteria and stores
+        # results so diagnose() can produce improvement recommendations.
+        from framework.runtime.evaluation import ExecutionEvaluator
+
+        self._evaluator = ExecutionEvaluator()
+
+        # Builder — applies improvement plans to the graph specification
+        # so the next execution benefits from structural changes.
+        from framework.runtime.builder import AgentBuilder
+
+        self._builder = AgentBuilder()
+
         # State
         self._running = False
 
@@ -769,6 +782,44 @@ class ExecutionStream:
 
                 # Store result with retention
                 self._record_execution_result(execution_id, result)
+
+                # --- Evaluation: score this execution against goal criteria ---
+                try:
+                    eval_result = self._evaluator.evaluate(
+                        result=result,
+                        goal=self.goal,
+                        stream_id=self.stream_id,
+                        execution_id=execution_id,
+                    )
+                    # Produce improvement plan and inject into session state so
+                    # the *next* execution can benefit from prior learnings.
+                    improvement = self._evaluator.diagnose(self.stream_id)
+                    if improvement.recommendations and result.session_state is not None:
+                        result.session_state["_improvement_context"] = (
+                            improvement.to_prompt_context()
+                        )
+
+                    # --- Builder: apply structural improvements to graph ---
+                    try:
+                        build_result = self._builder.build(
+                            self.graph, improvement
+                        )
+                        if build_result.modification_count > 0:
+                            logger.info(
+                                "Builder applied %d modification(s) to graph",
+                                build_result.modification_count,
+                            )
+                    except Exception:
+                        logger.debug("Builder failed (non-fatal)", exc_info=True)
+
+                    logger.info(
+                        "Evaluation complete for %s: score=%.2f, trend=%s",
+                        execution_id,
+                        eval_result.overall_score,
+                        improvement.trend,
+                    )
+                except Exception:
+                    logger.debug("Evaluation failed (non-fatal)", exc_info=True)
 
                 # End run to complete trace (for observability)
                 runtime_adapter.end_run(

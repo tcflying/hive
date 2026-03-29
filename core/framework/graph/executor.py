@@ -547,13 +547,24 @@ class GraphExecutor:
             for key, value in input_data.items():
                 memory.write(key, value)
 
+        # Inject improvement context from prior evaluations into the goal's
+        # context dict so it flows through to_prompt_context() automatically.
+        _improvement_ctx = (
+            session_state.get("_improvement_context") if session_state else None
+        )
+        if _improvement_ctx:
+            goal.context["_improvement_guidance"] = _improvement_ctx
+            self.logger.info("📈 Injected improvement guidance from prior evaluations")
+
         # Detect event-triggered execution (timer/webhook) — no interactive user.
         _event_triggered = bool(input_data and isinstance(input_data.get("event"), dict))
 
         path: list[str] = []
         total_tokens = 0
         total_latency = 0
-        node_retry_counts: dict[str, int] = {}  # Track retries per node
+        node_retry_counts: dict[str, int] = {}  # Track retries per node (resets on success)
+        # Cumulative retry history for quality reporting — never cleared
+        node_retry_history: dict[str, int] = {}
         node_visit_counts: dict[str, int] = {}  # Track visits for feedback loops
         _is_retry = False  # True when looping back for a retry (not a new visit)
 
@@ -949,7 +960,7 @@ class GraphExecutor:
                         current_node=node_spec.id,
                         execution_path=list(path),
                         memory=memory,
-                        is_clean=(sum(node_retry_counts.values()) == 0),
+                        is_clean=(sum(node_retry_history.values()) == 0),
                     )
 
                     if checkpoint_config.async_checkpoint:
@@ -1047,6 +1058,10 @@ class GraphExecutor:
                             )
 
                 if result.success:
+                    # Reset retry count on success so feedback-loop revisits
+                    # start with a fresh retry budget (fixes #6605).
+                    node_retry_counts.pop(current_node_id, None)
+
                     self.logger.info(
                         f"   ✓ Success (tokens: {result.tokens_used}, "
                         f"latency: {result.latency_ms}ms)"
@@ -1079,9 +1094,13 @@ class GraphExecutor:
 
                 # Handle failure
                 if not result.success:
-                    # Track retries per node
+                    # Track retries per node (resets on success for fresh budget)
                     node_retry_counts[current_node_id] = (
                         node_retry_counts.get(current_node_id, 0) + 1
+                    )
+                    # Also record in history (never cleared, for quality reporting)
+                    node_retry_history[current_node_id] = (
+                        node_retry_history.get(current_node_id, 0) + 1
                     )
 
                     # [CORRECTED] Use node_spec.max_retries instead of hardcoded 3
@@ -1169,8 +1188,8 @@ class GraphExecutor:
                             )
 
                             # Calculate quality metrics
-                            total_retries_count = sum(node_retry_counts.values())
-                            nodes_failed = list(node_retry_counts.keys())
+                            total_retries_count = sum(node_retry_history.values())
+                            nodes_failed = list(node_retry_history.keys())
 
                             if self.runtime_logger:
                                 await self.runtime_logger.end_run(
@@ -1202,7 +1221,7 @@ class GraphExecutor:
                                 path=path,
                                 total_retries=total_retries_count,
                                 nodes_with_failures=nodes_failed,
-                                retry_details=dict(node_retry_counts),
+                                retry_details=dict(node_retry_history),
                                 had_partial_failures=len(nodes_failed) > 0,
                                 execution_quality="failed",
                                 node_visit_counts=dict(node_visit_counts),
@@ -1240,8 +1259,8 @@ class GraphExecutor:
                     )
 
                     # Calculate quality metrics
-                    total_retries_count = sum(node_retry_counts.values())
-                    nodes_failed = [nid for nid, count in node_retry_counts.items() if count > 0]
+                    total_retries_count = sum(node_retry_history.values())
+                    nodes_failed = [nid for nid, count in node_retry_history.items() if count > 0]
                     exec_quality = "degraded" if total_retries_count > 0 else "clean"
 
                     if self.runtime_logger:
@@ -1263,7 +1282,7 @@ class GraphExecutor:
                         session_state=session_state_out,
                         total_retries=total_retries_count,
                         nodes_with_failures=nodes_failed,
-                        retry_details=dict(node_retry_counts),
+                        retry_details=dict(node_retry_history),
                         had_partial_failures=len(nodes_failed) > 0,
                         execution_quality=exec_quality,
                         node_visit_counts=dict(node_visit_counts),
@@ -1390,7 +1409,7 @@ class GraphExecutor:
                                 execution_path=list(path),
                                 memory=memory,
                                 next_node=next_node,
-                                is_clean=(sum(node_retry_counts.values()) == 0),
+                                is_clean=(sum(node_retry_history.values()) == 0),
                             )
 
                             if checkpoint_config.async_checkpoint:
@@ -1580,8 +1599,8 @@ class GraphExecutor:
             self.logger.info(f"   Total latency: {total_latency}ms")
 
             # Calculate execution quality metrics
-            total_retries_count = sum(node_retry_counts.values())
-            nodes_failed = [nid for nid, count in node_retry_counts.items() if count > 0]
+            total_retries_count = sum(node_retry_history.values())
+            nodes_failed = [nid for nid, count in node_retry_history.items() if count > 0]
             exec_quality = "degraded" if total_retries_count > 0 else "clean"
 
             # Update narrative to reflect execution quality
@@ -1616,7 +1635,7 @@ class GraphExecutor:
                 path=path,
                 total_retries=total_retries_count,
                 nodes_with_failures=nodes_failed,
-                retry_details=dict(node_retry_counts),
+                retry_details=dict(node_retry_history),
                 had_partial_failures=len(nodes_failed) > 0,
                 execution_quality=exec_quality,
                 node_visit_counts=dict(node_visit_counts),
@@ -1668,8 +1687,8 @@ class GraphExecutor:
             }
 
             # Calculate quality metrics
-            total_retries_count = sum(node_retry_counts.values())
-            nodes_failed = [nid for nid, count in node_retry_counts.items() if count > 0]
+            total_retries_count = sum(node_retry_history.values())
+            nodes_failed = [nid for nid, count in node_retry_history.items() if count > 0]
             exec_quality = "degraded" if total_retries_count > 0 else "clean"
 
             if self.runtime_logger:
@@ -1693,7 +1712,7 @@ class GraphExecutor:
                 session_state=session_state_out,
                 total_retries=total_retries_count,
                 nodes_with_failures=nodes_failed,
-                retry_details=dict(node_retry_counts),
+                retry_details=dict(node_retry_history),
                 had_partial_failures=len(nodes_failed) > 0,
                 execution_quality=exec_quality,
                 node_visit_counts=dict(node_visit_counts),
@@ -1725,8 +1744,8 @@ class GraphExecutor:
                 )
 
             # Calculate quality metrics even for exceptions
-            total_retries_count = sum(node_retry_counts.values())
-            nodes_failed = list(node_retry_counts.keys())
+            total_retries_count = sum(node_retry_history.values())
+            nodes_failed = list(node_retry_history.keys())
 
             if self.runtime_logger:
                 await self.runtime_logger.end_run(
@@ -1792,7 +1811,7 @@ class GraphExecutor:
                 path=path,
                 total_retries=total_retries_count,
                 nodes_with_failures=nodes_failed,
-                retry_details=dict(node_retry_counts),
+                retry_details=dict(node_retry_history),
                 had_partial_failures=len(nodes_failed) > 0,
                 execution_quality="failed",
                 node_visit_counts=dict(node_visit_counts),
